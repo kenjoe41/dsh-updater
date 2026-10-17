@@ -1,0 +1,12 @@
+# Runtime state; never publish.
+config.env
+state.json
+update.log
+npm.log
+web.log
+smoke.out
+smoke.err
+.lock
+cache/
+stage/
+prev/

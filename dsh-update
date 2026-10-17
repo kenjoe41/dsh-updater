@@ -1,0 +1,1124 @@
+#!/usr/bin/env bash
+# dsh-update — keep the DeepSeek Harness (DSH) npm install on the newest
+# prerelease, and reload the Web GUI onto it when nobody is mid-turn.
+#
+# Why a staged install: this machine's route to registry.npmjs.org is slow and
+# flaky (individual tarballs take minutes and ECONNRESET mid-install), so
+# unpacking straight over the live npm tree would leave the running server
+# importing half-written packages. The download lands in
+# ~/.dsh/updater/stage/<version>; the live tree is swapped only at reload time,
+# after a smoke test, and put back if the new server does not answer.
+#
+# Subcommands:
+#   check [--json]        what is installed vs the newest release (exit 10 = update)
+#   releases [N]          recent GitHub releases (default 10)
+#   stage [--force]       download + smoke-test the newest release (live tree untouched)
+#   activate [--force]    swap the staged release in and restart the GUI
+#   install [--force]     stage, then activate (idle-gated unless --force)
+#   auto                  what the systemd timer runs: adopt + stage + idle-gated activate
+#   reload [--force]      restart the GUI on the installed version
+#   status [--json]       versions, service, timer, last outcomes
+#   log [-n N]            tail the updater log
+#   config                print the effective configuration
+#   systemd [install|refresh|uninstall|status]
+#
+# Exit codes: 0 up to date / success, 10 update available, 20 error, 30 deferred
+# (a session was recently active, so the reload waited for the next tick).
+
+set -uo pipefail
+
+APP="dsh-update"
+VERSION="0.1.0"
+HOME_DIR="${HOME:-$(cd ~ 2>/dev/null && pwd)}"
+if [ -z "${DSH_NVM_BIN:-}" ]; then
+  if command -v dsh >/dev/null 2>&1; then
+    NVM_BIN="$(dirname "$(command -v dsh)")"
+  elif command -v npm >/dev/null 2>&1; then
+    NVM_BIN="$(dirname "$(command -v npm)")"
+  else
+    NVM_BIN="/usr/local/bin"
+  fi
+else
+  NVM_BIN="$DSH_NVM_BIN"
+fi
+NODE="$NVM_BIN/node"
+NPM="$NVM_BIN/npm"
+DSH="$NVM_BIN/dsh"
+GLOBAL_LIB="$NVM_BIN/../lib/node_modules"
+PKG_DIR="$GLOBAL_LIB/@deepseek-ai/dsh"
+BIN_LINK="$NVM_BIN/dsh"
+
+STATE_DIR="${DSH_UPDATE_STATE_DIR:-$HOME_DIR/.dsh/updater}"
+CONFIG_FILE="$STATE_DIR/config.env"
+STATE_FILE="$STATE_DIR/state.json"
+LOG_FILE="$STATE_DIR/update.log"
+NPM_LOG="$STATE_DIR/npm.log"
+SMOKE_OUT="$STATE_DIR/smoke.out"
+SMOKE_ERR="$STATE_DIR/smoke.err"
+LOCK_FILE="$STATE_DIR/.lock"
+CACHE_DIR="$STATE_DIR/cache"
+PACKUMENT="$CACHE_DIR/packument.json"
+ATOM_CACHE="$CACHE_DIR/releases.atom"
+STAGE_ROOT="$STATE_DIR/stage"
+PREV_ROOT="$STATE_DIR/prev"
+UNIT_DIR="$HOME_DIR/.config/systemd/user"
+SERVICE="dsh-web.service"
+UPDATE_SERVICE="dsh-update.service"
+UPDATE_TIMER="dsh-update.timer"
+GH_REPO="deepseek-ai/deepseek-harness"
+GH_ATOM="https://github.com/$GH_REPO/releases.atom"
+REGISTRY_URL="https://registry.npmjs.org/@deepseek-ai%2Fdsh"
+
+# ── defaults (config.env overrides any of these) ──────────────────────────────
+DSH_UPDATE_CHANNEL="${DSH_UPDATE_CHANNEL:-next}"   # next | alpha | latest | newest | tag:<name>
+DSH_UPDATE_AUTO_INSTALL="${DSH_UPDATE_AUTO_INSTALL:-1}"
+DSH_UPDATE_AUTO_RELOAD="${DSH_UPDATE_AUTO_RELOAD:-1}"
+DSH_UPDATE_QUIET_SECS="${DSH_UPDATE_QUIET_SECS:-300}"
+DSH_UPDATE_PORT="${DSH_UPDATE_PORT:-3080}"
+DSH_UPDATE_PROFILE="${DSH_UPDATE_PROFILE:-web}"
+DSH_UPDATE_KEEP_PREV="${DSH_UPDATE_KEEP_PREV:-1}"
+DSH_UPDATE_NOTIFY="${DSH_UPDATE_NOTIFY:-1}"
+DSH_UPDATE_INTERVAL_MIN="${DSH_UPDATE_INTERVAL_MIN:-15}"
+DSH_UPDATE_NPM_FLAGS="${DSH_UPDATE_NPM_FLAGS:---prefer-offline --fetch-retries=5 --fetch-retry-mintimeout=5000 --fetch-retry-maxtimeout=120000 --fetch-timeout=900000 --maxsockets=3 --no-audit --no-fund --no-progress}"
+
+# shellcheck source=/dev/null
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# ── output helpers ────────────────────────────────────────────────────────────
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+log() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  printf '%s [%s] %s\n' "$(ts)" "$$" "$*" >>"$LOG_FILE" 2>/dev/null
+  if [ -t 2 ]; then printf '%s\n' "$*" >&2; fi
+  return 0
+}
+
+say() { printf '%s\n' "$*"; }
+
+notify() {
+  [ "${DSH_UPDATE_NOTIFY:-1}" = "1" ] || return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 0
+  notify-send -a "$APP" -i dialog-information "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+trim_log() {
+  [ -f "$LOG_FILE" ] || return 0
+  local size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$size" -gt 2097152 ]; then
+    tail -n 2000 "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR" "$CACHE_DIR" "$STAGE_ROOT" "$PREV_ROOT"
+  [ -f "$STATE_FILE" ] || printf '{}\n' >"$STATE_FILE"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    cat >"$CONFIG_FILE" <<'EOF'
+# dsh-update configuration — edit, then `dsh-update systemd refresh` if you
+# change DSH_UPDATE_INTERVAL_MIN, PORT or PROFILE.
+#
+# Channel: next | alpha | latest | newest | tag:<name>
+#   next    the npm `next` dist-tag (release candidates) — the default
+#   alpha   the npm `alpha` dist-tag (bleeding edge)
+#   latest  the npm `latest` dist-tag
+#   newest  highest semver among every published version, alpha included
+DSH_UPDATE_CHANNEL="next"
+DSH_UPDATE_AUTO_INSTALL="1"
+DSH_UPDATE_AUTO_RELOAD="1"
+# Do not stop/restart the GUI until no session has written for this many seconds.
+DSH_UPDATE_QUIET_SECS="300"
+DSH_UPDATE_PORT="3080"
+DSH_UPDATE_PROFILE="web"
+# How many previous installs to keep for rollback (each is ~0.5 GB).
+DSH_UPDATE_KEEP_PREV="1"
+DSH_UPDATE_NOTIFY="1"
+DSH_UPDATE_INTERVAL_MIN="15"
+EOF
+  fi
+}
+
+staged_pkg_dir() {
+  printf '%s/prefix/lib/node_modules/@deepseek-ai/dsh\n' "$STAGE_ROOT/$1"
+}
+
+# ── locking ───────────────────────────────────────────────────────────────────
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "another $APP run holds $LOCK_FILE; exiting"
+    return 1
+  fi
+  return 0
+}
+
+# ── state ─────────────────────────────────────────────────────────────────────
+state_get() {
+  [ -f "$STATE_FILE" ] || return 0
+  "$NODE" - "$STATE_FILE" "$1" <<'NODE' 2>/dev/null
+const fs = require('fs');
+try {
+  const s = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const v = s[process.argv[3]];
+  if (v === undefined || v === null) process.exit(0);
+  process.stdout.write(typeof v === 'string' ? v : JSON.stringify(v));
+} catch {}
+NODE
+}
+
+state_set() {
+  "$NODE" - "$STATE_FILE" "$1" "$2" <<'NODE' 2>/dev/null
+const fs = require('fs');
+const path = require('path');
+const [file, key, value] = process.argv.slice(2);
+let state = {};
+try { state = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+state[key] = value;
+fs.mkdirSync(path.dirname(file), { recursive: true });
+fs.writeFileSync(file + '.tmp', JSON.stringify(state, null, 2) + '\n');
+fs.renameSync(file + '.tmp', file);
+NODE
+}
+
+# ── versions ──────────────────────────────────────────────────────────────────
+installed_version() {
+  if [ -f "$PKG_DIR/package.json" ]; then
+    "$NODE" -p "require('$PKG_DIR/package.json').version" 2>/dev/null
+  elif [ -x "$DSH" ]; then
+    "$DSH" --version 2>/dev/null | tail -1
+  fi
+}
+
+version_of_pkg_dir() {
+  [ -f "$1/package.json" ] || return 1
+  "$NODE" -p "require('$1/package.json').version" 2>/dev/null
+}
+
+fetch_packument() {
+  mkdir -p "$CACHE_DIR"
+  local tmp="$PACKUMENT.tmp.$$"
+  if ! curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors --max-time 60 \
+      -H 'accept: application/json' "$REGISTRY_URL" -o "$tmp" 2>>"$LOG_FILE"; then
+    rm -f "$tmp"
+    log "registry fetch failed"
+    return 1
+  fi
+  if ! "$NODE" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$tmp" >/dev/null 2>>"$LOG_FILE"; then
+    rm -f "$tmp"
+    log "registry returned invalid JSON"
+    return 1
+  fi
+  mv "$tmp" "$PACKUMENT"
+}
+
+# Prints one JSON object: target (version), tag, newest, published, tags, update.
+pick_target() {
+  local file="$1" channel="$2" installed="${3:-}"
+  "$NODE" - "$file" "$channel" "$installed" <<'NODE'
+const fs = require('fs');
+const [file, channel, installed] = process.argv.slice(2);
+const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+const tags = p['dist-tags'] || {};
+const versions = Object.keys(p.versions || {});
+
+function parse(v) {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(v);
+  if (!m) return null;
+  return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] ? m[4].split('.') : [] };
+}
+function cmp(a, b) {
+  const A = parse(a), B = parse(b);
+  if (!A || !B) return null;
+  for (const k of ['major', 'minor', 'patch']) {
+    if (A[k] !== B[k]) return A[k] < B[k] ? -1 : 1;
+  }
+  if (!A.pre.length && !B.pre.length) return 0;
+  if (!A.pre.length) return 1;
+  if (!B.pre.length) return -1;
+  for (let i = 0; i < Math.max(A.pre.length, B.pre.length); i++) {
+    const x = A.pre[i], y = B.pre[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y);
+    if (xn && yn) { const d = +x - +y; if (d) return d < 0 ? -1 : 1; }
+    else if (xn) return -1;
+    else if (yn) return 1;
+    else if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+let target = null, tag = null, error = null;
+if (channel === 'newest') {
+  const valid = versions.filter(parse).sort(cmp);
+  target = valid[valid.length - 1] || null;
+  tag = 'newest';
+} else if (channel.startsWith('tag:')) {
+  tag = channel.slice(4);
+  target = tags[tag] || null;
+} else if (channel.startsWith('version:')) {
+  target = channel.slice(8);
+  tag = 'version';
+} else {
+  tag = channel;
+  target = tags[tag] || null;
+}
+const valid = versions.filter(parse).sort(cmp);
+const newest = valid[valid.length - 1] || null;
+if (!target) {
+  error = `channel "${channel}" is not a dist-tag (have: ${Object.keys(tags).join(', ')})`;
+} else if (!parse(target)) {
+  error = `target "${target}" is not a semver version`;
+}
+if (error) {
+  console.error(error);
+  process.exit(2);
+}
+const order = installed && parse(installed) ? cmp(target, installed) : 1;
+console.log(JSON.stringify({
+  target,
+  tag,
+  newest,
+  published: (p.time && p.time[target]) || null,
+  tags,
+  installed: installed || null,
+  update: order === null ? true : order > 0,
+}));
+NODE
+}
+
+# Recent GitHub releases as a JSON array (best effort; empty array on failure).
+releases_json() {
+  local limit="${1:-10}" age=9999
+  mkdir -p "$CACHE_DIR"
+  if [ -f "$ATOM_CACHE" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$ATOM_CACHE" 2>/dev/null || echo 0) ))
+  fi
+  if [ "$age" -gt 600 ]; then
+    # GitHub is slow from this network; never let it hold up a check.
+    if curl -fsSL --max-time 12 "$GH_ATOM" -o "$ATOM_CACHE.tmp.$$" 2>>"$LOG_FILE"; then
+      mv "$ATOM_CACHE.tmp.$$" "$ATOM_CACHE"
+    else
+      rm -f "$ATOM_CACHE.tmp.$$"
+    fi
+  fi
+  [ -f "$ATOM_CACHE" ] || { printf '[]\n'; return 0; }
+  "$NODE" - "$ATOM_CACHE" "$limit" <<'NODE'
+const fs = require('fs');
+const xml = fs.readFileSync(process.argv[2], 'utf8');
+const limit = parseInt(process.argv[3] || '10', 10);
+const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
+const out = entries.slice(0, limit).map((e) => {
+  const pick = (re) => { const m = e.match(re); return m ? m[1] : ''; };
+  const title = pick(/<title>([^<]*)<\/title>/);
+  return {
+    title,
+    version: title.replace(/^v/, ''),
+    updated: pick(/<updated>([^<]*)<\/updated>/),
+    url: pick(/<link[^>]*href="([^"]+)"/),
+  };
+});
+console.log(JSON.stringify(out));
+NODE
+}
+
+# ── process / service helpers ─────────────────────────────────────────────────
+service_active() { systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; }
+service_state() {
+  local s
+  s=$(systemctl --user is-active "$SERVICE" 2>/dev/null)
+  printf '%s\n' "${s:-inactive}"
+}
+
+port_pid() {
+  local pid
+  pid=$(ss -ltnp 2>/dev/null | awk -v p=":$DSH_UPDATE_PORT" '$4 ~ (p "$")' \
+        | sed -nE 's/.*pid=([0-9]+).*/\1/p' | head -1)
+  if [ -z "$pid" ]; then
+    pid=$(lsof -tiTCP:"$DSH_UPDATE_PORT" -sTCP:LISTEN 2>/dev/null | head -1)
+  fi
+  [ -n "$pid" ] && printf '%s\n' "$pid"
+  return 0
+}
+
+is_dsh_web_pid() {
+  local pid="$1" cmd
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+  case "$cmd" in
+    *dsh*--profile*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+port_open() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+        "http://127.0.0.1:$DSH_UPDATE_PORT/" 2>/dev/null)
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+wait_up() {
+  local timeout="${1:-90}" i
+  for ((i = 0; i < timeout; i++)); do
+    if port_open; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+start_service() {
+  systemctl --user reset-failed "$SERVICE" 2>/dev/null || true
+  systemctl --user start "$SERVICE" 2>>"$LOG_FILE"
+}
+
+stop_server() {
+  if service_active; then
+    systemctl --user stop "$SERVICE" 2>>"$LOG_FILE"
+    for ((i = 0; i < 30; i++)); do
+      port_open || return 0
+      sleep 1
+    done
+    return 1
+  fi
+  local pid
+  pid=$(port_pid)
+  [ -z "$pid" ] && return 0
+  if ! is_dsh_web_pid "$pid"; then
+    log "stop: port $DSH_UPDATE_PORT is held by non-dsh pid $pid; refusing to kill it"
+    return 1
+  fi
+  log "stopping manual dsh web pid $pid"
+  kill -TERM "$pid" 2>/dev/null || true
+  for ((i = 0; i < 30; i++)); do
+    if [ -z "$(port_pid)" ]; then return 0; fi
+    sleep 1
+  done
+  log "pid $pid still holds the port; sending SIGKILL"
+  kill -KILL "$pid" 2>/dev/null || true
+  sleep 1
+  [ -z "$(port_pid)" ] && return 0
+  return 1
+}
+
+ensure_bin_link() {
+  if [ ! -e "$BIN_LINK" ]; then
+    ln -s ../lib/node_modules/@deepseek-ai/dsh/lib/bin.js "$BIN_LINK" 2>>"$LOG_FILE" || true
+  fi
+  if ! "$BIN_LINK" --version >/dev/null 2>&1; then
+    log "warning: $BIN_LINK does not run after the swap"
+    return 1
+  fi
+  return 0
+}
+
+# ── idle detection ────────────────────────────────────────────────────────────
+newest_session_activity() {
+  find "$HOME_DIR/.dsh/sessions" -type f -name 'session.v*.jsonl.zstd' \
+       -printf '%T@\n' 2>/dev/null | sort -n | tail -1
+}
+
+busy_reason() {
+  local newest now age
+  now=$(date +%s)
+  newest=$(newest_session_activity)
+  if [ -z "$newest" ]; then
+    say "no session activity found"
+    return 1
+  fi
+  newest=${newest%.*}
+  age=$((now - newest))
+  if [ "$age" -lt "${DSH_UPDATE_QUIET_SECS:-300}" ]; then
+    say "last session write ${age}s ago (< ${DSH_UPDATE_QUIET_SECS}s quiet window)"
+    return 0
+  fi
+  say "idle: last session write ${age}s ago"
+  return 1
+}
+
+# ── staging ───────────────────────────────────────────────────────────────────
+stage_install() {
+  local ver="$1"
+  local dir="$STAGE_ROOT/$ver"
+  local prefix="$dir/prefix"
+  local pkg="$prefix/lib/node_modules/@deepseek-ai/dsh"
+  local attempt rc=1
+  if [ -f "$pkg/package.json" ] && [ "$(version_of_pkg_dir "$pkg")" = "$ver" ]; then
+    log "staged tree for $ver already present"
+    printf '%s\n' "$pkg"
+    return 0
+  fi
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  for attempt in 1 2 3; do
+    log "npm install dsh@$ver (attempt $attempt/3)"
+    # shellcheck disable=SC2086
+    "$NPM" install --global --prefix "$prefix" "@deepseek-ai/dsh@$ver" $DSH_UPDATE_NPM_FLAGS \
+      >>"$NPM_LOG" 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] && break
+    log "npm install attempt $attempt failed (rc=$rc); retrying"
+    sleep $((attempt * 10))
+  done
+  if [ "$rc" -ne 0 ]; then
+    log "npm install failed after 3 attempts; see $NPM_LOG"
+    return 1
+  fi
+  if [ ! -f "$pkg/package.json" ]; then
+    log "npm reported success but $pkg/package.json is missing"
+    return 1
+  fi
+  local got
+  got=$(version_of_pkg_dir "$pkg")
+  if [ "$got" != "$ver" ]; then
+    log "staged version is $got, expected $ver"
+    return 1
+  fi
+  printf '%s\n' "$pkg"
+  return 0
+}
+
+smoke_check() {
+  local pkg="$1" ver="$2" got
+  got=$(timeout 30 "$NODE" "$pkg/lib/bin.js" --version 2>>"$SMOKE_ERR" | tail -1)
+  if [ "$got" != "$ver" ]; then
+    log "smoke: --version returned '$got', expected '$ver'"
+    return 1
+  fi
+  if ! timeout 180 "$NODE" "$pkg/lib/bin.js" --profile "$DSH_UPDATE_PROFILE" --help \
+       >"$SMOKE_OUT" 2>>"$SMOKE_ERR"; then
+    log "smoke: profile '$DSH_UPDATE_PROFILE' failed to compose under $ver"
+    return 1
+  fi
+  if ! grep -q "Usage: dsh --profile $DSH_UPDATE_PROFILE" "$SMOKE_OUT"; then
+    log "smoke: unexpected help output under $ver"
+    return 1
+  fi
+  return 0
+}
+
+prune_prev() {
+  local keep="${DSH_UPDATE_KEEP_PREV:-1}"
+  [ "$keep" -lt 0 ] && keep=0
+  ls -1dt "$PREV_ROOT"/dsh-* 2>/dev/null | tail -n +"$((keep + 1))" | xargs -r rm -rf
+}
+
+# ── activation ────────────────────────────────────────────────────────────────
+rollback_to() {
+  local prev="$1" old="$2" new="$3"
+  log "rolling back to $old"
+  rm -rf "$PKG_DIR"
+  if ! mv "$prev" "$PKG_DIR"; then
+    log "rollback: cannot restore $prev"
+  fi
+  ensure_bin_link || true
+  start_service
+  if wait_up 90; then
+    log "rollback: web GUI is up on $old"
+    state_set last_error "v$new failed to start; rolled back to $old at $(ts)"
+    notify "DSH update failed" "v$new did not start; rolled back to $old."
+  else
+    log "rollback: web GUI is STILL DOWN"
+    state_set last_error "v$new and v$old both failed to start at $(ts)"
+    notify "DSH is down" "Both v$new and v$old failed to start. See $LOG_FILE"
+  fi
+}
+
+activate_staged() {
+  local newver="$1" force="${2:-}"
+  local pkg
+  pkg=$(staged_pkg_dir "$newver")
+  local oldver prev rc
+
+  if [ ! -d "$pkg" ]; then
+    log "activate: no staged tree at $pkg"
+    return 1
+  fi
+  oldver=$(installed_version)
+  if [ -z "$oldver" ]; then
+    log "activate: cannot determine installed version"
+    return 1
+  fi
+  if [ "$oldver" = "$newver" ]; then
+    log "activate: $newver is already installed; dropping the staged copy"
+    rm -rf "$STAGE_ROOT/$newver"
+    state_set staged_version ""
+    start_service && wait_up 60
+    state_set last_activated_version "$newver"
+    state_set last_activated_at "$(ts)"
+    return 0
+  fi
+  if [ "$force" != "--force" ] && busy_reason; then
+    log "activate: deferred — $(busy_reason)"
+    return 30
+  fi
+  if [ ! -f "$UNIT_DIR/$SERVICE" ]; then
+    log "activate: $UNIT_DIR/$SERVICE is missing; run '$APP systemd install'"
+    return 1
+  fi
+
+  log "activate: $oldver -> $newver"
+  state_set activating_version "$newver"
+  if ! stop_server; then
+    log "activate: could not stop the current server"
+    return 1
+  fi
+  prev="$PREV_ROOT/dsh-$oldver-$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$PREV_ROOT"
+  if ! mv "$PKG_DIR" "$prev"; then
+    log "activate: cannot move the current package aside"
+    start_service
+    wait_up 60 || true
+    return 1
+  fi
+  if ! mv "$pkg" "$PKG_DIR"; then
+    log "activate: cannot move the staged package into place; restoring"
+    mv "$prev" "$PKG_DIR"
+    ensure_bin_link || true
+    start_service
+    wait_up 60 || true
+    return 1
+  fi
+  ensure_bin_link || true
+  if ! start_service; then
+    log "activate: systemctl start failed"
+    rollback_to "$prev" "$oldver" "$newver"
+    return 1
+  fi
+  if ! wait_up 90; then
+    log "activate: the web GUI did not answer within 90s"
+    rollback_to "$prev" "$oldver" "$newver"
+    return 1
+  fi
+
+  prune_prev
+  state_set installed_version "$newver"
+  state_set staged_version ""
+  state_set last_activated_version "$newver"
+  state_set last_activated_at "$(ts)"
+  state_set last_error ""
+  state_set activating_version ""
+  log "activate: web GUI is up on $newver"
+  local url="https://github.com/$GH_REPO/releases/tag/dsh-v$newver"
+  notify "DSH updated to $newver" "The web GUI reloaded onto the new prerelease."
+  say "activated $newver"
+  say "release: $url"
+  return 0
+}
+
+# ── adoption of a manually started server ────────────────────────────────────
+adopt_service() {
+  local force="${1:-}" pid
+  if service_active; then
+    return 0
+  fi
+  if [ ! -f "$UNIT_DIR/$SERVICE" ]; then
+    log "adopt: $UNIT_DIR/$SERVICE is missing; run '$APP systemd install'"
+    return 1
+  fi
+  if [ "$force" != "--force" ] && busy_reason; then
+    log "adopt: deferred — $(busy_reason)"
+    return 30
+  fi
+  pid=$(port_pid)
+  if [ -n "$pid" ]; then
+    if ! is_dsh_web_pid "$pid"; then
+      log "adopt: port $DSH_UPDATE_PORT is held by non-dsh pid $pid; refusing to kill it"
+      return 1
+    fi
+    log "adopt: moving manual dsh web (pid $pid) under systemd"
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((i = 0; i < 30; i++)); do
+      [ -z "$(port_pid)" ] && break
+      sleep 1
+    done
+    if [ -n "$(port_pid)" ]; then
+      log "adopt: pid $pid still holds the port; SIGKILL"
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 1
+    fi
+    if [ -n "$(port_pid)" ]; then
+      log "adopt: port $DSH_UPDATE_PORT is still held; refusing to start a second server"
+      return 1
+    fi
+  fi
+  if ! start_service; then
+    log "adopt: systemctl start failed"
+    return 1
+  fi
+  if ! wait_up 60; then
+    log "adopt: the web GUI did not come up"
+    return 1
+  fi
+  state_set adopted_at "$(ts)"
+  state_set last_activated_version "$(installed_version)"
+  state_set last_activated_at "$(ts)"
+  state_set last_reload "$(ts)"
+  log "adopt: web GUI now runs under $SERVICE"
+  return 0
+}
+
+# ── systemd units ─────────────────────────────────────────────────────────────
+write_units() {
+  mkdir -p "$UNIT_DIR"
+  cat >"$UNIT_DIR/$SERVICE" <<EOF
+[Unit]
+Description=DeepSeek Harness web GUI (dsh --profile $DSH_UPDATE_PROFILE)
+Documentation=https://github.com/$GH_REPO/releases
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=4
+
+[Service]
+Type=simple
+WorkingDirectory=$HOME_DIR
+Environment=HOME=$HOME_DIR
+Environment=PATH=$NVM_BIN:/usr/local/bin:/usr/bin:/bin
+Environment=DSH_WEB_PORT=$DSH_UPDATE_PORT
+ExecStart=$DSH --profile $DSH_UPDATE_PROFILE --port $DSH_UPDATE_PORT --no-open
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+StandardOutput=append:$STATE_DIR/web.log
+StandardError=append:$STATE_DIR/web.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+  cat >"$UNIT_DIR/$UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Check for a newer DeepSeek Harness prerelease and stage it
+Documentation=file://$STATE_DIR/update.log
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$HOME_DIR/bin/$APP auto
+Environment=HOME=$HOME_DIR
+Environment=PATH=$NVM_BIN:/usr/local/bin:/usr/bin:/bin
+Environment=DSH_UPDATE_NONINTERACTIVE=1
+SuccessExitStatus=0 10 20 30
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+  cat >"$UNIT_DIR/$UPDATE_TIMER" <<EOF
+[Unit]
+Description=Periodic DeepSeek Harness prerelease check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${DSH_UPDATE_INTERVAL_MIN}min
+RandomizedDelaySec=60
+Persistent=true
+Unit=$UPDATE_SERVICE
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+cmd_systemd() {
+  local action="${1:-install}"
+  case "$action" in
+    install|refresh)
+      ensure_dirs
+      write_units
+      systemctl --user daemon-reload
+      systemctl --user enable "$SERVICE" >/dev/null 2>&1 || true
+      systemctl --user enable --now "$UPDATE_TIMER" >/dev/null 2>&1
+      if [ "$action" = "refresh" ]; then
+        systemctl --user restart "$UPDATE_TIMER" >/dev/null 2>&1 || true
+      fi
+      say "installed $UNIT_DIR/$SERVICE"
+      say "installed $UNIT_DIR/$UPDATE_SERVICE"
+      say "installed $UNIT_DIR/$UPDATE_TIMER"
+      say "timer: every ${DSH_UPDATE_INTERVAL_MIN} min (next: $(systemctl --user show -p NextElapseUSecRealtime --value "$UPDATE_TIMER" 2>/dev/null || echo unknown))"
+      say "the GUI moves under systemd at the first idle check; run '$APP reload --force' to do it now."
+      ;;
+    uninstall)
+      systemctl --user disable --now "$UPDATE_TIMER" >/dev/null 2>&1 || true
+      systemctl --user disable "$SERVICE" >/dev/null 2>&1 || true
+      rm -f "$UNIT_DIR/$UPDATE_TIMER" "$UNIT_DIR/$UPDATE_SERVICE" "$UNIT_DIR/$SERVICE"
+      systemctl --user daemon-reload
+      say "removed the dsh updater units (the web service, if running, was left as-is)"
+      ;;
+    status)
+      systemctl --user list-unit-files "$SERVICE" "$UPDATE_SERVICE" "$UPDATE_TIMER" --no-pager 2>/dev/null || true
+      systemctl --user list-timers "$UPDATE_TIMER" --no-pager 2>/dev/null || true
+      ;;
+    *)
+      say "usage: $APP systemd [install|refresh|uninstall|status]"
+      return 2
+      ;;
+  esac
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+cmd_check() {
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+  ensure_dirs
+  local installed info target update published tag rel_url rel_title status
+  installed=$(installed_version)
+  if ! fetch_packument; then
+    if [ "$json" = 1 ]; then
+      printf '{"error":"registry unreachable","installed":"%s"}\n' "$installed"
+    else
+      say "error: registry unreachable (see $LOG_FILE)"
+    fi
+    return 20
+  fi
+  if ! info=$(pick_target "$PACKUMENT" "$DSH_UPDATE_CHANNEL" "$installed" 2>>"$LOG_FILE"); then
+    say "error: cannot resolve channel '$DSH_UPDATE_CHANNEL' (see $LOG_FILE)"
+    return 20
+  fi
+  target=$(jq -r '.target' <<<"$info")
+  update=$(jq -r '.update' <<<"$info")
+  published=$(jq -r '.published // empty' <<<"$info")
+  tag=$(jq -r '.tag' <<<"$info")
+  rel_url="https://github.com/$GH_REPO/releases/tag/dsh-v$target"
+  rel_title="v$target"
+  if [ "$update" = "true" ]; then status="UPDATE AVAILABLE"; else status="up to date"; fi
+
+  if [ "$json" = 1 ]; then
+    jq -n \
+      --arg installed "$installed" --arg channel "$DSH_UPDATE_CHANNEL" \
+      --arg target "$target" --arg tag "$tag" --arg published "$published" \
+      --arg releaseTitle "$rel_title" --arg releaseUrl "$rel_url" \
+      --arg status "$status" --argjson update "$update" \
+      '{installed:$installed,channel:$channel,target:$target,tag:$tag,update:$update,published:$published,release:{title:$releaseTitle,url:$releaseUrl},status:$status}'
+  else
+    say "installed : ${installed:-unknown}"
+    say "channel   : $DSH_UPDATE_CHANNEL (npm \"$tag\")"
+    say "available : $target${published:+   (published $published)}"
+    if [ -n "$rel_title" ]; then
+      say "release   : $rel_title  $rel_url"
+    else
+      say "release   : $rel_url"
+    fi
+    local staged
+    staged=$(state_get staged_version)
+    say "staged    : ${staged:-nothing}"
+    local svc
+    svc=$(service_state)
+    if [ "$svc" = "active" ]; then
+      say "service   : active (systemd)"
+    else
+      local pid
+      pid=$(port_pid)
+      if [ -n "$pid" ]; then say "service   : manual server pid $pid"; else say "service   : not running"; fi
+    fi
+    say "status    : $status"
+  fi
+  [ "$update" = "true" ] && return 10
+  return 0
+}
+
+cmd_releases() {
+  local n="${1:-10}" out
+  ensure_dirs
+  out=$(releases_json "$n")
+  if [ "$(jq -r 'length' <<<"$out" 2>/dev/null)" = "0" ]; then
+    # GitHub unreachable: list the registry's own publish history instead.
+    fetch_packument || { say "no release data (registry unreachable)"; return 20; }
+    out=$("$NODE" - "$PACKUMENT" "$n" <<'NODE'
+const fs = require('fs');
+const [file, n] = process.argv.slice(2);
+const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+const time = p.time || {};
+const out = Object.keys(p.versions || {})
+  .filter((v) => time[v])
+  .sort((a, b) => (time[b] || '').localeCompare(time[a] || ''))
+  .slice(0, parseInt(n, 10))
+  .map((v) => ({
+    title: 'v' + v,
+    version: v,
+    updated: time[v],
+    url: 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v' + v,
+  }));
+console.log(JSON.stringify(out));
+NODE
+)
+  fi
+  jq -r '.[] | "\(.title)\t\(.updated)\t\(.url)"' <<<"$out" | column -t -s $'\t'
+  return 0
+}
+
+cmd_stage() {
+  local force="${1:-}" installed info target rc pkg
+  ensure_dirs
+  acquire_lock || return 0
+  installed=$(installed_version)
+  fetch_packument || return 20
+  info=$(pick_target "$PACKUMENT" "$DSH_UPDATE_CHANNEL" "$installed") || return 20
+  target=$(jq -r '.target' <<<"$info")
+  if [ "$(jq -r '.update' <<<"$info")" != "true" ] && [ "$force" != "--force" ]; then
+    say "up to date: $installed"
+    return 0
+  fi
+  if [ "$(state_get staged_version)" = "$target" ]; then
+    pkg=$(staged_pkg_dir "$target")
+    if [ -d "$pkg" ] && [ "$force" != "--force" ]; then
+      say "already staged: $target"
+      return 0
+    fi
+  fi
+  say "staging $target (installed: ${installed:-unknown})…"
+  pkg=$(stage_install "$target") || {
+    state_set last_error "npm install of $target failed at $(ts)"
+    notify "DSH update failed" "Could not download $target. See $LOG_FILE"
+    return 20
+  }
+  if ! smoke_check "$pkg" "$target"; then
+    state_set last_error "smoke test of $target failed at $(ts)"
+    notify "DSH update failed" "$target did not pass the startup smoke test."
+    say "smoke test failed; see $SMOKE_ERR"
+    return 20
+  fi
+  state_set staged_version "$target"
+  state_set staged_at "$(ts)"
+  state_set last_error ""
+  notify "DSH $target downloaded" "It will be activated when the GUI is idle."
+  say "staged $target at $pkg"
+  return 0
+}
+
+cmd_activate() {
+  local force="${1:-}" staged rc
+  ensure_dirs
+  acquire_lock || return 0
+  staged=$(state_get staged_version)
+  if [ -z "$staged" ]; then
+    say "nothing staged — run '$APP stage' first"
+    return 1
+  fi
+  activate_staged "$staged" "$force"
+  rc=$?
+  if [ "$rc" -eq 30 ]; then
+    say "deferred: a session was active recently; the timer will retry"
+    return 30
+  fi
+  return "$rc"
+}
+
+cmd_install() {
+  local force="${1:-}"
+  cmd_stage || return $?
+  cmd_activate "$force"
+}
+
+cmd_reload() {
+  local force="${1:-}" rc
+  ensure_dirs
+  acquire_lock || return 0
+  if ! service_active; then
+    adopt_service "$force"
+    return $?
+  fi
+  if [ "$force" != "--force" ] && busy_reason; then
+    say "deferred: a session was active recently; the timer will retry"
+    return 30
+  fi
+  log "reload: restarting $SERVICE"
+  systemctl --user restart "$SERVICE" 2>>"$LOG_FILE"
+  if wait_up 90; then
+    state_set last_reload "$(ts)"
+    say "reloaded: $(installed_version)"
+    return 0
+  fi
+  say "reload failed; see $LOG_FILE"
+  return 1
+}
+
+cmd_auto() {
+  local installed info target update staged rc
+  ensure_dirs
+  acquire_lock || return 0
+  trim_log
+
+  # One-time migration (and recovery): get the GUI under systemd, but never
+  # take it away from an active turn.
+  if ! service_active; then
+    if busy_reason >/dev/null; then
+      log "auto: adoption deferred — $(busy_reason)"
+    else
+      adopt_service || log "auto: adoption failed"
+    fi
+  fi
+
+  installed=$(installed_version)
+  state_set installed_version "$installed"
+  state_set last_check "$(ts)"
+  if ! fetch_packument; then
+    log "auto: registry unreachable"
+    return 0
+  fi
+  if ! info=$(pick_target "$PACKUMENT" "$DSH_UPDATE_CHANNEL" "$installed" 2>>"$LOG_FILE"); then
+    log "auto: cannot resolve channel"
+    return 0
+  fi
+  target=$(jq -r '.target' <<<"$info")
+  update=$(jq -r '.update' <<<"$info")
+
+  if [ "$update" != "true" ]; then
+    log "auto: up to date ($installed)"
+    state_set available_version "$installed"
+    # A staged tree for an older target is stale; drop the marker.
+    staged=$(state_get staged_version)
+    if [ -n "$staged" ]; then
+      rm -rf "$STAGE_ROOT/$staged"
+      state_set staged_version ""
+    fi
+    return 0
+  fi
+  log "auto: update available: $installed -> $target"
+  state_set available_version "$target"
+
+  if [ "${DSH_UPDATE_AUTO_INSTALL:-1}" = "1" ]; then
+    staged=$(state_get staged_version)
+    if [ "$staged" != "$target" ] || [ ! -d "$(staged_pkg_dir "$target")" ]; then
+      local pkg
+      if pkg=$(stage_install "$target"); then
+        if smoke_check "$pkg" "$target"; then
+          state_set staged_version "$target"
+          state_set staged_at "$(ts)"
+          notify "DSH $target downloaded" "It will be activated when the GUI is idle."
+          log "auto: staged $target"
+        else
+          state_set last_error "smoke test of $target failed at $(ts)"
+          notify "DSH update failed" "$target did not pass the startup smoke test."
+          log "auto: smoke test failed for $target"
+          return 20
+        fi
+      else
+        state_set last_error "npm install of $target failed at $(ts)"
+        notify "DSH update failed" "Could not download $target. See $LOG_FILE"
+        return 20
+      fi
+    else
+      log "auto: $target already staged"
+    fi
+  fi
+
+  if [ "${DSH_UPDATE_AUTO_RELOAD:-1}" = "1" ] && [ "$(state_get staged_version)" = "$target" ]; then
+    if busy_reason >/dev/null; then
+      log "auto: reload deferred — $(busy_reason)"
+      return 0
+    fi
+    activate_staged "$target"
+    rc=$?
+    [ "$rc" -eq 30 ] && log "auto: activation deferred"
+    return 0
+  fi
+  return 0
+}
+
+cmd_status() {
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+  ensure_dirs
+  local installed staged svc pid timer last_check last_error last_activated url
+  installed=$(installed_version)
+  staged=$(state_get staged_version)
+  svc=$(service_state)
+  pid=$(port_pid)
+  timer=$(systemctl --user is-active "$UPDATE_TIMER" 2>/dev/null)
+  [ -z "$timer" ] && timer=inactive
+  last_check=$(state_get last_check)
+  last_error=$(state_get last_error)
+  last_activated=$(state_get last_activated_version)
+
+  if [ "$json" = 1 ]; then
+    jq -n --arg installed "$installed" --arg staged "$staged" --arg service "$svc" \
+      --arg pid "$pid" --arg timer "$timer" --arg lastCheck "$last_check" \
+      --arg lastError "$last_error" --arg activated "$last_activated" \
+      '{installed:$installed,staged:$staged,service:$service,pid:$pid,timer:$timer,lastCheck:$lastCheck,lastActivatedVersion:$activated,lastError:$lastError}'
+    return 0
+  fi
+  say "installed : ${installed:-unknown}"
+  say "staged    : ${staged:-nothing}"
+  say "channel   : $DSH_UPDATE_CHANNEL"
+  say "service   : $svc"
+  [ -n "$pid" ] && say "listening : pid $pid on 127.0.0.1:$DSH_UPDATE_PORT"
+  if [ "$timer" = "active" ]; then
+    local next
+    next=$(systemctl --user show -p NextElapseUSecRealtime --value "$UPDATE_TIMER" 2>/dev/null)
+    say "timer     : active${next:+ (next $next)}"
+  else
+    say "timer     : $timer"
+  fi
+  say "lastCheck : ${last_check:-never}"
+  say "activated : ${last_activated:-unknown}"
+  [ -n "$last_error" ] && say "lastError : $last_error"
+  return 0
+}
+
+cmd_log() {
+  local n=40
+  [ "${1:-}" = "-n" ] && n="${2:-40}"
+  [ -f "$LOG_FILE" ] || { say "no log yet at $LOG_FILE"; return 0; }
+  tail -n "$n" "$LOG_FILE"
+}
+
+cmd_config() {
+  ensure_dirs
+  say "config file: $CONFIG_FILE"
+  grep -vE '^\s*(#|$)' "$CONFIG_FILE" 2>/dev/null || true
+  say ""
+  say "effective: channel=$DSH_UPDATE_CHANNEL interval=${DSH_UPDATE_INTERVAL_MIN}min port=$DSH_UPDATE_PORT profile=$DSH_UPDATE_PROFILE"
+  say "           autoInstall=$DSH_UPDATE_AUTO_INSTALL autoReload=$DSH_UPDATE_AUTO_RELOAD quiet=${DSH_UPDATE_QUIET_SECS}s keepPrev=$DSH_UPDATE_KEEP_PREV"
+}
+
+usage() {
+  cat <<EOF
+$APP $VERSION — keep the DeepSeek Harness npm install on the newest prerelease.
+
+Usage: $APP <command> [options]
+
+  check [--json]       Show installed vs newest release (exit 10 = update available)
+  releases [N]         List the N most recent GitHub releases (default 10)
+  stage [--force]      Download + smoke-test the newest release (live tree untouched)
+  activate [--force]   Swap the staged release in and restart the GUI
+  install [--force]    stage then activate (idle-gated unless --force)
+  auto                 What the systemd timer runs (adopt + stage + idle-gated activate)
+  reload [--force]     Restart the GUI on the installed version
+  status [--json]      Versions, service, timer and last outcomes
+  log [-n N]           Tail the updater log
+  config               Show the effective configuration
+  systemd              install | refresh | uninstall | status the systemd units
+
+Files: $STATE_DIR (log, state, staged + previous installs)
+Config: $CONFIG_FILE
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+  case "$cmd" in
+    version|--version|-V) say "$APP $VERSION" ;;
+    check)      cmd_check "$@" ;;
+    releases)   cmd_releases "$@" ;;
+    stage)      cmd_stage "$@" ;;
+    activate)   cmd_activate "$@" ;;
+    install)    cmd_install "$@" ;;
+    auto)       cmd_auto "$@" ;;
+    reload)     cmd_reload "$@" ;;
+    status)     cmd_status "$@" ;;
+    log)        cmd_log "$@" ;;
+    config)     cmd_config "$@" ;;
+    systemd)    cmd_systemd "$@" ;;
+    help|-h|--help) usage ;;
+    *) say "unknown command: $cmd"; usage; return 2 ;;
+  esac
+}
+
+main "$@"
