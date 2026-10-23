@@ -4,7 +4,7 @@ Keeps the globally installed `@deepseek-ai/dsh` on the newest npm prerelease
 and reloads the Web GUI onto it. Everything lives in `~/.dsh/updater/`; the
 command is on `PATH` as `dsh-update` (`~/bin/dsh-update`).
 
-**Version 0.1.0**
+**Version 0.1.1**
 
 ## Install
 
@@ -34,10 +34,17 @@ Logs: `~/.dsh/updater/update.log` (updater), `npm.log` (npm output),
 ## How an update happens
 
 1. **Check** — reads the npm packument once and resolves the channel
-   (`next` by default). The GitHub releases page is linked but never required.
+   (`next` by default). The packument is fetched compressed with retries, and
+   the last cached copy is used if the registry is unreachable. The GitHub
+   releases page is linked but never required.
 2. **Stage** — `npm install -g --prefix ~/.dsh/updater/stage/<ver>` into an
    isolated prefix. The live npm tree is untouched, so a slow/flaky registry
-   can take as long as it needs. Three attempts, then stop.
+   can take as long as it needs. Three attempts for network errors, then stop.
+   An `ETARGET` is not a download failure: either the release is still being
+   published (the top-level package is visible before all sub-packages) or the
+   local npm cache is stale. The installer uses `--prefer-online`, so a stale
+   cache is revalidated; a genuinely partial release defers staging for 30
+   minutes and is retried by the next timer instead of hammering npm.
 3. **Smoke** — the staged copy must print its version and compose the whole
    profile (`dsh --profile web --help`), which catches plugin/peer
    incompatibilities before anything is swapped.
