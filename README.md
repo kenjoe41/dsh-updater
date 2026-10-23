@@ -4,7 +4,7 @@ Keeps the globally installed `@deepseek-ai/dsh` on the newest npm prerelease
 and reloads the Web GUI onto it. Everything lives in `~/.dsh/updater/`; the
 command is on `PATH` as `dsh-update` (`~/bin/dsh-update`).
 
-**Version 0.1.1**
+**Version 0.1.2**
 
 ## Install
 
@@ -30,6 +30,10 @@ the first `auto` (or `reload --force`) moves the GUI under systemd.
 
 Logs: `~/.dsh/updater/update.log` (updater), `npm.log` (npm output),
 `web.log` (the web server, including the `dsh web: http://…?token=…` line).
+
+The timer is quiet when up to date: it writes to `update.log` only when a new
+target appears, when staging starts/succeeds, and on errors. Repeated "up to
+date", deferral and already-staged lines are not logged.
 
 ## How an update happens
 

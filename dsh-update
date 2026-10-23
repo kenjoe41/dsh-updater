@@ -28,7 +28,7 @@
 set -uo pipefail
 
 APP="dsh-update"
-VERSION="0.1.1"
+VERSION="0.1.2"
 HOME_DIR="${HOME:-$(cd ~ 2>/dev/null && pwd)}"
 if [ -z "${DSH_NVM_BIN:-}" ]; then
   if command -v dsh >/dev/null 2>&1; then
@@ -148,7 +148,6 @@ staged_pkg_dir() {
 acquire_lock() {
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    log "another $APP run holds $LOCK_FILE; exiting"
     return 1
   fi
   return 0
@@ -991,9 +990,7 @@ cmd_auto() {
   # One-time migration (and recovery): get the GUI under systemd, but never
   # take it away from an active turn.
   if ! service_active; then
-    if busy_reason >/dev/null; then
-      log "auto: adoption deferred — $(busy_reason)"
-    else
+    if ! busy_reason >/dev/null; then
       adopt_service || log "auto: adoption failed"
     fi
   fi
@@ -1013,8 +1010,8 @@ cmd_auto() {
   update=$(jq -r '.update' <<<"$info")
 
   if [ "$update" != "true" ]; then
-    log "auto: up to date ($installed)"
     state_set available_version "$installed"
+    state_set announced_version ""
     # A staged tree for an older target is stale; drop the marker.
     staged=$(state_get staged_version)
     if [ -n "$staged" ]; then
@@ -1025,14 +1022,16 @@ cmd_auto() {
     state_set stage_retry_target ""
     return 0
   fi
-  log "auto: update available: $installed -> $target"
+  if [ "$(state_get announced_version)" != "$target" ]; then
+    log "auto: update available: $installed -> $target"
+    state_set announced_version "$target"
+  fi
   state_set available_version "$target"
 
   if [ "${DSH_UPDATE_AUTO_INSTALL:-1}" = "1" ]; then
     staged=$(state_get staged_version)
     if [ "$staged" != "$target" ] || [ ! -d "$(staged_pkg_dir "$target")" ]; then
       if stage_deferred "$target"; then
-        log "auto: waiting for $target (registry still publishing sub-packages)"
         return 0
       fi
       pkg=$(stage_install "$target"); rc=$?
@@ -1060,19 +1059,14 @@ cmd_auto() {
         log "auto: smoke test failed for $target"
         return 20
       fi
-    else
-      log "auto: $target already staged"
     fi
   fi
 
   if [ "${DSH_UPDATE_AUTO_RELOAD:-1}" = "1" ] && [ "$(state_get staged_version)" = "$target" ]; then
     if busy_reason >/dev/null; then
-      log "auto: reload deferred — $(busy_reason)"
       return 0
     fi
     activate_staged "$target"
-    rc=$?
-    [ "$rc" -eq 30 ] && log "auto: activation deferred"
     return 0
   fi
   return 0
